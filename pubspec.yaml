@@ -1,0 +1,46 @@
+name: qrshield
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  http: ^1.6.0
+  image_picker: ^1.2.1
+  path_provider: ^2.1.5
+  pdf: ^3.8.0
+  excel: ^4.0.6
+  share_plus: ^12.0.1
+  intl: ^0.20.2
+  shared_preferences: ^2.5.5
+  url_launcher: ^6.3.2
+  device_preview: ^1.1.0
+  image: ^4.3.0
+  barcode_scanner: ^7.0.0
+  google_mlkit_barcode_scanning: ^0.14.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.4
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/images/logo.png"
+  min_sdk_android: 21
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/images/
