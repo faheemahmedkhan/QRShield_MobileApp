@@ -1,22 +1,22 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:ui' as ui;
+
+import 'package:device_preview/device_preview.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:excel/excel.dart' as xl;
-import 'package:share_plus/share_plus.dart';
 import 'package:intl/intl.dart';
-
 import 'package:url_launcher/url_launcher.dart';
-import 'package:device_preview/device_preview.dart';
 import 'package:google_mlkit_barcode_scanning/google_mlkit_barcode_scanning.dart';
+import 'package:image/image.dart' as img;
 
 // ─── Design Tokens ─────────────────────────────────────────────────────────────
 // Following 4-base rule: 4, 8, 12, 16, 20, 24, 32, 40, 48, 64
@@ -51,7 +51,7 @@ class AppFontSize {
 }
 
 class AppColors {
-  // Light Theme Color
+  // Light Theme Colors
   static const Color lightBg = Color(0xFFF8FAFC);
   static const Color lightSurface = Color(0xFFFFFFFF);
   static const Color lightSurfaceElevated = Color(0xFFF1F5F9);
@@ -142,7 +142,7 @@ class AppTextStyles {
 void main() {
   runApp(
     DevicePreview(
-      enabled: true,
+      enabled: false,
       builder: (context) => const QRShieldTesterApp(),
     ),
   );
@@ -777,7 +777,7 @@ class _MainShellState extends State<MainShell> {
     return Scaffold(
       appBar: AppBar(
         title: Image.asset(
-          'assets/images/logo.png',
+          'assets/logo.png',
           width: 80,
           height: 80,
           fit: BoxFit.contain,
@@ -1205,12 +1205,15 @@ class TestingScreen extends StatefulWidget {
 class _TestingScreenState extends State<TestingScreen> {
   final ImagePicker _picker = ImagePicker();
   final TextEditingController _urlController = TextEditingController(
-    text: 'http://72.62.246.243:8080/scan',
+    text: 'http://72.62.246.243:1214/scan',
   );
   File? _image;
+
+  File? _pickedOriginal;
   bool _isLoading = false;
   Map<String, dynamic>? _result;
-  String _backendUrl = 'http://72.62.246.243:8080/scan';
+  final String _backendUrl = 'http://72.62.246.243:8080/scan';
+  static const String _cropServerUrl = 'http://72.62.246.243:7979/crop';
   final BarcodeScanner _qrScanner = BarcodeScanner(
     formats: [BarcodeFormat.qrCode],
   );
@@ -1222,73 +1225,345 @@ class _TestingScreenState extends State<TestingScreen> {
     super.dispose();
   }
 
-  Future<void> _pickImage(ImageSource source) async {
-    final XFile? pickedFile = await _picker.pickImage(source: source);
-    if (pickedFile != null) {
-      setState(() {
-        _image = File(pickedFile.path);
-        _result = null;
-        _isLoading = true;
-      });
-      try {
-        final cropped = await _cropToQrIfPossible(_image!);
-        setState(() => _image = cropped);
-        await _analyzeImage();
-      } finally {
-        if (mounted) setState(() => _isLoading = false);
+  Rect _qrCropRect(Barcode barcode, int imageWidth, int imageHeight) {
+    double left;
+    double top;
+    double right;
+    double bottom;
+
+    final corners = barcode.cornerPoints;
+    if (corners.length >= 4) {
+      final xs = corners.map((p) => p.x.toDouble()).toList();
+      final ys = corners.map((p) => p.y.toDouble()).toList();
+      left = xs.reduce(math.min);
+      right = xs.reduce(math.max);
+      top = ys.reduce(math.min);
+      bottom = ys.reduce(math.max);
+    } else {
+      final box = barcode.boundingBox;
+      left = box.left;
+      top = box.top;
+      right = box.right;
+      bottom = box.bottom;
+    }
+
+    if (right <= 1.5 && bottom <= 1.5 && right > 0 && bottom > 0) {
+      left *= imageWidth;
+      right *= imageWidth;
+      top *= imageHeight;
+      bottom *= imageHeight;
+    }
+
+    final maxX = math.max(right, left);
+    final maxY = math.max(bottom, top);
+    if (maxX > imageWidth * 1.02 || maxY > imageHeight * 1.02) {
+      final scale = math.min(imageWidth / maxX, imageHeight / maxY);
+      left *= scale;
+      right *= scale;
+      top *= scale;
+      bottom *= scale;
+    }
+
+    var qrW = (right - left).abs();
+    var qrH = (bottom - top).abs();
+    if (qrW < 8 || qrH < 8) {
+      final box = barcode.boundingBox;
+      left = box.left;
+      top = box.top;
+      right = box.right;
+      bottom = box.bottom;
+      if (right <= 1.5 && bottom <= 1.5) {
+        left *= imageWidth;
+        right *= imageWidth;
+        top *= imageHeight;
+        bottom *= imageHeight;
       }
+      qrW = (right - left).abs();
+      qrH = (bottom - top).abs();
+    }
+
+    final centerX = (left + right) / 2;
+    final centerY = (top + bottom) / 2;
+
+    // Square QR, small quiet zone (~6%) — not so tight that crop breaks.
+    const marginFactor = 1.06;
+    var half = math.max(qrW, qrH) * marginFactor / 2;
+    half = half.clamp(24.0, math.min(imageWidth, imageHeight) / 2.0);
+
+    var cropLeft = centerX - half;
+    var cropTop = centerY - half;
+    var cropRight = centerX + half;
+    var cropBottom = centerY + half;
+
+    if (cropLeft < 0) {
+      cropRight -= cropLeft;
+      cropLeft = 0;
+    }
+    if (cropTop < 0) {
+      cropBottom -= cropTop;
+      cropTop = 0;
+    }
+    if (cropRight > imageWidth) {
+      cropLeft -= cropRight - imageWidth;
+      cropRight = imageWidth.toDouble();
+    }
+    if (cropBottom > imageHeight) {
+      cropTop -= cropBottom - imageHeight;
+      cropBottom = imageHeight.toDouble();
+    }
+
+    cropLeft = cropLeft.clamp(0.0, imageWidth - 2.0);
+    cropTop = cropTop.clamp(0.0, imageHeight - 2.0);
+    cropRight = cropRight.clamp(cropLeft + 2, imageWidth.toDouble());
+    cropBottom = cropBottom.clamp(cropTop + 2, imageHeight.toDouble());
+
+    return Rect.fromLTRB(cropLeft, cropTop, cropRight, cropBottom);
+  }
+
+  double _barcodeArea(Barcode b, int imageWidth, int imageHeight) {
+    final r = _qrCropRect(b, imageWidth, imageHeight);
+    return r.width * r.height;
+  }
+
+  /// Camera + gallery: same upright JPEG (EXIF baked, size capped for ML Kit).
+  Future<img.Image?> _decodeUprightBitmap(File input) async {
+    final bytes = await input.readAsBytes();
+    var bitmap = img.decodeImage(bytes);
+    if (bitmap == null) return null;
+    bitmap = img.bakeOrientation(bitmap);
+
+    const maxSide = 2048;
+    if (bitmap.width > maxSide || bitmap.height > maxSide) {
+      if (bitmap.width >= bitmap.height) {
+        bitmap = img.copyResize(bitmap, width: maxSide);
+      } else {
+        bitmap = img.copyResize(bitmap, height: maxSide);
+      }
+    }
+    return bitmap;
+  }
+
+  Future<File> _bitmapToJpegFile(img.Image bitmap, String prefix) async {
+    final dir = await getTemporaryDirectory();
+    final out = File(
+      '${dir.path}/${prefix}_${DateTime.now().millisecondsSinceEpoch}.jpg',
+    );
+    await out.writeAsBytes(img.encodeJpg(bitmap, quality: 92));
+    return out;
+  }
+
+  Future<List<Barcode>> _detectBarcodes(img.Image bitmap, File jpegFile) async {
+    try {
+      final fromFile = await _qrScanner.processImage(
+        InputImage.fromFilePath(jpegFile.path),
+      );
+      if (fromFile.isNotEmpty) return fromFile;
+    } catch (_) {}
+
+    var rgba = bitmap;
+    if (bitmap.numChannels != 4) {
+      rgba = bitmap.convert(numChannels: 4);
+    }
+    try {
+      final fromBmp = await _qrScanner.processImage(
+        InputImage.fromBitmap(
+          bitmap: rgba.getBytes(order: img.ChannelOrder.rgba),
+          width: bitmap.width,
+          height: bitmap.height,
+        ),
+      );
+      if (fromBmp.isNotEmpty) return fromBmp;
+    } catch (_) {}
+
+    try {
+      return await _qrScanner.processImage(
+        InputImage.fromBitmap(
+          bitmap: rgba.getBytes(order: img.ChannelOrder.bgra),
+          width: bitmap.width,
+          height: bitmap.height,
+        ),
+      );
+    } catch (_) {
+      return [];
     }
   }
 
-  Future<File> _cropToQrIfPossible(File input) async {
+  Barcode _largestBarcode(List<Barcode> barcodes, int w, int h) {
+    Barcode best = barcodes.first;
+    var bestArea = _barcodeArea(best, w, h);
+    for (var i = 1; i < barcodes.length; i++) {
+      final a = _barcodeArea(barcodes[i], w, h);
+      if (a > bestArea) {
+        bestArea = a;
+        best = barcodes[i];
+      }
+    }
+    return best;
+  }
+
+  /// Server crop (tight B&W QR) — falls back to on-device ML Kit crop.
+  Future<File?> _cropViaServer(File imageFile) async {
     try {
-      final inputImage = InputImage.fromFilePath(input.path);
-      final barcodes = await _qrScanner.processImage(inputImage);
-      if (barcodes.isEmpty) return input;
-
-      final rect = barcodes.first.boundingBox;
-      if (rect == null) return input;
-
-      final bytes = await input.readAsBytes();
-      final codec = await ui.instantiateImageCodec(bytes);
-      final frame = await codec.getNextFrame();
-      final decoded = frame.image;
-
-      final pad = math.max(
-        16,
-        (math.max(rect.width, rect.height) * 0.18).round(),
+      final request = http.MultipartRequest('POST', Uri.parse(_cropServerUrl));
+      request.files.add(
+        await http.MultipartFile.fromPath('file', imageFile.path),
       );
-      final x1 = (rect.left.round() - pad).clamp(0, decoded.width - 1);
-      final y1 = (rect.top.round() - pad).clamp(0, decoded.height - 1);
-      final x2 = (rect.right.round() + pad).clamp(1, decoded.width);
-      final y2 = (rect.bottom.round() + pad).clamp(1, decoded.height);
-      final w = math.max(1, x2 - x1);
-      final h = math.max(1, y2 - y1);
-
-      final recorder = ui.PictureRecorder();
-      final canvas = ui.Canvas(recorder);
-      final src = ui.Rect.fromLTWH(
-        x1.toDouble(),
-        y1.toDouble(),
-        w.toDouble(),
-        h.toDouble(),
+      final streamed = await request.send().timeout(
+        const Duration(seconds: 60),
       );
-      final dst = ui.Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble());
-      final paint = ui.Paint()..filterQuality = ui.FilterQuality.high;
-      canvas.drawImageRect(decoded, src, dst, paint);
-      final picture = recorder.endRecording();
-      final cropped = await picture.toImage(w, h);
-      final png = await cropped.toByteData(format: ui.ImageByteFormat.png);
-      if (png == null) return input;
+      final response = await http.Response.fromStream(streamed);
+      if (response.statusCode != 200) return null;
+
+      final data = json.decode(response.body) as Map<String, dynamic>;
+      if (data['ok'] != true) return null;
+
+      final b64 = data['cropped_base64'] as String?;
+      if (b64 == null || b64.isEmpty) return null;
 
       final dir = await getTemporaryDirectory();
       final out = File(
-        '${dir.path}/qr_crop_${DateTime.now().millisecondsSinceEpoch}.png',
+        '${dir.path}/qr_srv_${DateTime.now().millisecondsSinceEpoch}.jpg',
       );
-      await out.writeAsBytes(png.buffer.asUint8List());
+      await out.writeAsBytes(base64Decode(b64));
       return out;
     } catch (_) {
-      return input;
+      return null;
+    }
+  }
+
+  // ─── Enhanced On-Device Crop ─────────────────────────────────────────────
+
+  /// Multi-strategy on-device crop.  Tries three preprocessings in order:
+  ///   1. Colour-normalised bitmap   (fastest, works for high-contrast QRs)
+  ///   2. Greyscale conversion       (helps low-contrast / monochrome prints)
+  ///   3. Contrast-boosted version   (helps faded, low-light, or printed QRs)
+  ///
+  /// Returns the tightly-cropped QR [File] or null when every strategy fails.
+  Future<File?> _cropToQrIfPossible(
+    img.Image bitmap,
+    File normalizedJpeg,
+  ) async {
+    // Strategy 1 ── colour, as-is
+    final result1 = await _tryDetectAndCrop(bitmap, normalizedJpeg);
+    if (result1 != null) return result1;
+
+    // Strategy 2 ── greyscale (better for mono/low-contrast QRs)
+    try {
+      final gray = img.grayscale(bitmap);
+      final grayFile = await _bitmapToJpegFile(gray, 'qr_gray');
+      final result2 = await _tryDetectAndCrop(gray, grayFile);
+      if (result2 != null) return result2;
+    } catch (_) {}
+
+    // Strategy 3 ── contrast-enhanced (helps faded / poorly-lit QRs)
+    try {
+      final enhanced = img.adjustColor(bitmap, contrast: 1.6);
+      final enhFile = await _bitmapToJpegFile(enhanced, 'qr_enh');
+      final result3 = await _tryDetectAndCrop(enhanced, enhFile);
+      if (result3 != null) return result3;
+    } catch (_) {}
+
+    // All strategies exhausted — caller will fall back to full image
+    return null;
+  }
+
+  /// Detect QR barcodes in [bitmap]/[jpegFile] and return a tightly-cropped
+  /// JPEG of only the QR code region. Returns null if no QR is detected or
+  /// the detected region is too small to be reliable.
+  Future<File?> _tryDetectAndCrop(
+    img.Image bitmap,
+    File jpegFile,
+  ) async {
+    try {
+      final w = bitmap.width;
+      final h = bitmap.height;
+
+      final barcodes = await _detectBarcodes(bitmap, jpegFile);
+      if (barcodes.isEmpty) return null;
+
+      final best = _largestBarcode(barcodes, w, h);
+      final rect = _qrCropRect(best, w, h);
+
+      // Reject if the computed QR region is implausibly small
+      if (rect.width < 16 || rect.height < 16) return null;
+
+      final x1 = rect.left.floor().clamp(0, w - 1);
+      final y1 = rect.top.floor().clamp(0, h - 1);
+      final cropW = math.max(1, rect.width.floor().clamp(1, w - x1));
+      final cropH = math.max(1, rect.height.floor().clamp(1, h - y1));
+
+      final cropped = img.copyCrop(
+        bitmap,
+        x: x1,
+        y: y1,
+        width: cropW,
+        height: cropH,
+      );
+
+      return _bitmapToJpegFile(cropped, 'qr_crop');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// One pipeline for camera and gallery — always sends only the QR patch.
+  ///
+  /// Priority:
+  ///   1. Server-side crop  → tight B&W QR from the /crop endpoint
+  ///   2. On-device crop    → multi-strategy ML Kit + image preprocessing
+  ///   3. Full normalised image (last resort when no QR can be located)
+  Future<void> _processPickedImage(
+    File raw, {
+    bool keepOriginalPreview = false,
+  }) async {
+    final bitmap = await _decodeUprightBitmap(raw);
+    if (bitmap == null) return;
+
+    // Orientation-corrected, size-capped JPEG ─────────────────────────────
+    final normalized = await _bitmapToJpegFile(bitmap, 'qr_norm');
+
+    // 1. Server-side crop (tight B&W QR) ──────────────────────────────────
+    File? cropped = await _cropViaServer(normalized);
+
+    // 2. Enhanced on-device multi-strategy crop ───────────────────────────
+    cropped ??= await _cropToQrIfPossible(bitmap, normalized);
+
+    // 3. Last resort — send the full normalised image ─────────────────────
+    //    (occurs only when no QR code can be located at all)
+    cropped ??= normalized;
+
+    if (!mounted) return;
+    setState(() {
+      _pickedOriginal = keepOriginalPreview ? raw : null;
+      _image = cropped;
+    });
+    await _analyzeImage();
+  }
+
+  Future<void> _pickImage(ImageSource source) async {
+    final XFile? pickedFile = await _picker.pickImage(
+      source: source,
+      imageQuality: 95,
+      preferredCameraDevice: CameraDevice.rear,
+      requestFullMetadata: true,
+    );
+    if (pickedFile == null) return;
+
+    final raw = File(pickedFile.path);
+    setState(() {
+      _pickedOriginal = null;
+      _image = null;
+      _result = null;
+      _isLoading = true;
+    });
+
+    try {
+      await _processPickedImage(
+        raw,
+        keepOriginalPreview: source == ImageSource.camera,
+      );
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
@@ -1336,7 +1611,7 @@ class _TestingScreenState extends State<TestingScreen> {
     } catch (e) {
       setState(() => _result = {'error': 'Connection failed: $e'});
     } finally {
-      setState(() => _isLoading = false);
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
@@ -1379,6 +1654,7 @@ class _TestingScreenState extends State<TestingScreen> {
 
   Widget _buildDropZone() {
     final hasImage = _image != null;
+    final showCameraDual = _pickedOriginal != null;
     final isDark = Theme.of(context).brightness == Brightness.dark;
 
     return _TacticalCard(
@@ -1391,61 +1667,159 @@ class _TestingScreenState extends State<TestingScreen> {
           height: 240,
           width: double.infinity,
           child: hasImage
-              ? Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    Image.file(_image!, fit: BoxFit.cover),
-                    Container(
-                      decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          begin: Alignment.topCenter,
-                          end: Alignment.bottomCenter,
-                          colors: [
-                            Colors.transparent,
-                            Theme.of(
-                              context,
-                            ).scaffoldBackgroundColor.withValues(alpha: 0.7),
-                          ],
-                        ),
-                      ),
-                    ),
-                    Positioned(
-                      bottom: AppSpacing.md,
-                      left: AppSpacing.md,
-                      child: Container(
-                        padding: EdgeInsets.symmetric(
-                          horizontal: AppSpacing.sm,
-                          vertical: AppSpacing.xs,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Theme.of(
-                            context,
-                          ).scaffoldBackgroundColor.withValues(alpha: 0.9),
-                          borderRadius: BorderRadius.circular(AppRadius.xs),
-                          border: Border.all(
-                            color: AppColors.blue.withValues(alpha: 0.4),
-                          ),
-                        ),
+              ? showCameraDual
+                    ? Padding(
+                        padding: const EdgeInsets.all(AppSpacing.md),
                         child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            const Icon(
-                              Icons.check_circle_rounded,
-                              size: 14,
-                              color: AppColors.green,
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  Expanded(
+                                    child: ClipRRect(
+                                      borderRadius: BorderRadius.circular(
+                                        AppRadius.xs,
+                                      ),
+                                      child: ColoredBox(
+                                        color: isDark
+                                            ? AppColors.darkBg
+                                            : AppColors.lightBg,
+                                        child: Image.file(
+                                          _pickedOriginal!,
+                                          fit: BoxFit.contain,
+                                          alignment: Alignment.center,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                  SizedBox(height: AppSpacing.xs),
+                                  Text(
+                                    'ORIGINAL',
+                                    textAlign: TextAlign.center,
+                                    style: AppTextStyles.labelXs(context)
+                                        .copyWith(
+                                          color: Theme.of(context).hintColor,
+                                          fontWeight: FontWeight.w800,
+                                        ),
+                                  ),
+                                ],
+                              ),
                             ),
-                            SizedBox(width: AppSpacing.xs),
-                            Text(
-                              'IMAGE LOADED',
-                              style: AppTextStyles.labelXs(
-                                context,
-                              ).copyWith(color: AppColors.green),
+                            SizedBox(width: AppSpacing.sm),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  Expanded(
+                                    child: ClipRRect(
+                                      borderRadius: BorderRadius.circular(
+                                        AppRadius.xs,
+                                      ),
+                                      child: ColoredBox(
+                                        color: isDark
+                                            ? AppColors.darkBg
+                                            : AppColors.lightBg,
+                                        child: Image.file(
+                                          _image!,
+                                          fit: BoxFit.contain,
+                                          alignment: Alignment.center,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                  SizedBox(height: AppSpacing.xs),
+                                  Text(
+                                    'QR CROP',
+                                    textAlign: TextAlign.center,
+                                    style: AppTextStyles.labelXs(context)
+                                        .copyWith(
+                                          color: AppColors.green,
+                                          fontWeight: FontWeight.w800,
+                                        ),
+                                  ),
+                                ],
+                              ),
                             ),
                           ],
                         ),
-                      ),
-                    ),
-                  ],
-                )
+                      )
+                    : Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          Positioned.fill(
+                            child: ColoredBox(
+                              color: isDark
+                                  ? AppColors.darkBg
+                                  : AppColors.lightBg,
+                              child: Padding(
+                                padding: const EdgeInsets.all(AppSpacing.md),
+                                child: Image.file(
+                                  _image!,
+                                  fit: BoxFit.contain,
+                                  alignment: Alignment.center,
+                                ),
+                              ),
+                            ),
+                          ),
+                          Positioned(
+                            left: 0,
+                            right: 0,
+                            bottom: 0,
+                            height: 88,
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  begin: Alignment.topCenter,
+                                  end: Alignment.bottomCenter,
+                                  colors: [
+                                    Colors.transparent,
+                                    Theme.of(context).scaffoldBackgroundColor
+                                        .withValues(alpha: 0.85),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                          Positioned(
+                            bottom: AppSpacing.md,
+                            left: AppSpacing.md,
+                            child: Container(
+                              padding: EdgeInsets.symmetric(
+                                horizontal: AppSpacing.sm,
+                                vertical: AppSpacing.xs,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Theme.of(context).scaffoldBackgroundColor
+                                    .withValues(alpha: 0.9),
+                                borderRadius: BorderRadius.circular(
+                                  AppRadius.xs,
+                                ),
+                                border: Border.all(
+                                  color: AppColors.blue.withValues(alpha: 0.4),
+                                ),
+                              ),
+                              child: Row(
+                                children: [
+                                  const Icon(
+                                    Icons.check_circle_rounded,
+                                    size: 14,
+                                    color: AppColors.green,
+                                  ),
+                                  SizedBox(width: AppSpacing.xs),
+                                  Text(
+                                    'IMAGE LOADED',
+                                    style: AppTextStyles.labelXs(
+                                      context,
+                                    ).copyWith(color: AppColors.green),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      )
               : Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
