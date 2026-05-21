@@ -1512,6 +1512,10 @@ class _TestingScreenState extends State<TestingScreen> {
   ///   1. Server-side crop  → tight B&W QR from the /crop endpoint
   ///   2. On-device crop    → multi-strategy ML Kit + image preprocessing
   ///   3. Full normalised image (last resort when no QR can be located)
+  ///
+  /// The final image is ALWAYS converted to greyscale before being sent to
+  /// the DL model — colour information is irrelevant for QR detection and
+  /// sending greyscale keeps payload size smaller.
   Future<void> _processPickedImage(
     File raw, {
     bool keepOriginalPreview = false,
@@ -1532,12 +1536,29 @@ class _TestingScreenState extends State<TestingScreen> {
     //    (occurs only when no QR code can be located at all)
     cropped ??= normalized;
 
+    // 4. Convert to greyscale — DL model always receives a greyscale QR ───
+    cropped = await _toGrayscaleFile(cropped);
+
     if (!mounted) return;
     setState(() {
       _pickedOriginal = keepOriginalPreview ? raw : null;
       _image = cropped;
     });
     await _analyzeImage();
+  }
+
+  /// Decodes [src] JPEG, converts to 8-bit greyscale, and saves as a new
+  /// JPEG file. Returns [src] unchanged if decoding fails.
+  Future<File> _toGrayscaleFile(File src) async {
+    try {
+      final bytes = await src.readAsBytes();
+      final decoded = img.decodeImage(bytes);
+      if (decoded == null) return src;
+      final gray = img.grayscale(decoded);
+      return _bitmapToJpegFile(gray, 'qr_final_gray');
+    } catch (_) {
+      return src; // fallback: send original if conversion fails
+    }
   }
 
   Future<void> _pickImage(ImageSource source) async {
