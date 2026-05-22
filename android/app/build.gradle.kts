@@ -15,7 +15,7 @@ val hasKeystore = keyPropertiesFile.exists().also { exists ->
 }
 
 android {
-    namespace = "com.qrshieldpro.app"
+    namespace = "qrshieldpro.com"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -29,7 +29,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.qrshieldpro.app"
+        applicationId = "qrshieldpro.com"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
