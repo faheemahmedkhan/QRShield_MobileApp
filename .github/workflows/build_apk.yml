@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Android APK & AAB
 
 on:
   push:
@@ -8,8 +8,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-apk:
-    name: Build APK
+  build:
+    name: Build APK & AAB
     runs-on: ubuntu-latest
 
     steps:
@@ -34,9 +34,19 @@ jobs:
       - name: Build release APK
         run: flutter build apk --release
 
+      - name: Build release AAB
+        run: flutter build appbundle --release
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: QRShield-APK
           path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
+
+      - name: Upload AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: QRShield-AAB
+          path: build/app/outputs/bundle/release/app-release.aab
           retention-days: 30
