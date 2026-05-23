@@ -29,7 +29,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "qrshieldpro.com"
+        applicationId = "com.qrshieldpro"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
