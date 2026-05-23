@@ -1,3 +1,4 @@
+# QRShield CI — builds signed APK & AAB on every push
 name: Build Android APK & AAB
 
 on:
