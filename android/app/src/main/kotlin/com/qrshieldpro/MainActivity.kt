@@ -1,4 +1,4 @@
-package com.example.qrshield
+package com.qrshieldpro
 
 import io.flutter.embedding.android.FlutterActivity
 
