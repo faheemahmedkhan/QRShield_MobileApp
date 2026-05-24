@@ -17,6 +17,7 @@ import 'package:intl/intl.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:google_mlkit_barcode_scanning/google_mlkit_barcode_scanning.dart';
 import 'package:image/image.dart' as img;
+import 'package:mobile_scanner/mobile_scanner.dart';
 
 // ─── Design Tokens ─────────────────────────────────────────────────────────────
 // Following 4-base rule: 4, 8, 12, 16, 20, 24, 32, 40, 48, 64
@@ -1562,10 +1563,35 @@ class _TestingScreenState extends State<TestingScreen> {
   }
 
   Future<void> _pickImage(ImageSource source) async {
+    if (source == ImageSource.camera) {
+      // ── Live in-app scanner ──────────────────────────────────────────────
+      final result = await Navigator.of(context).push<File?>(
+        MaterialPageRoute(
+          fullscreenDialog: true,
+          builder: (_) => _LiveScannerScreen(
+            onImageReady: (file) => Navigator.of(context).pop(file),
+          ),
+        ),
+      );
+      if (result == null || !mounted) return;
+      setState(() {
+        _pickedOriginal = null;
+        _image = null;
+        _result = null;
+        _isLoading = true;
+      });
+      try {
+        await _processPickedImage(result, keepOriginalPreview: true);
+      } finally {
+        if (mounted) setState(() => _isLoading = false);
+      }
+      return;
+    }
+
+    // ── Gallery (unchanged) ───────────────────────────────────────────────
     final XFile? pickedFile = await _picker.pickImage(
       source: source,
       imageQuality: 95,
-      preferredCameraDevice: CameraDevice.rear,
       requestFullMetadata: true,
     );
     if (pickedFile == null) return;
@@ -1579,10 +1605,7 @@ class _TestingScreenState extends State<TestingScreen> {
     });
 
     try {
-      await _processPickedImage(
-        raw,
-        keepOriginalPreview: source == ImageSource.camera,
-      );
+      await _processPickedImage(raw, keepOriginalPreview: false);
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
@@ -2150,6 +2173,413 @@ class _TestingScreenState extends State<TestingScreen> {
       ],
     );
   }
+}
+
+// ─── Live Scanner Screen ──────────────────────────────────────────────────────
+
+/// Fullscreen live camera QR scanner with animated blue scan line.
+/// Captures a still JPEG when a QR code is detected and passes it back
+/// to the caller via [onImageReady]. Uses MobileScanner for the camera
+/// feed and draws the animated overlay entirely in Flutter.
+class _LiveScannerScreen extends StatefulWidget {
+  final void Function(File imageFile) onImageReady;
+
+  const _LiveScannerScreen({required this.onImageReady});
+
+  @override
+  State<_LiveScannerScreen> createState() => _LiveScannerScreenState();
+}
+
+class _LiveScannerScreenState extends State<_LiveScannerScreen>
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+  // ── Camera controller ─────────────────────────────────────────────────
+  late final MobileScannerController _camController;
+
+  // ── Scan-line animation ────────────────────────────────────────────────
+  late final AnimationController _lineCtrl;
+  late final Animation<double> _lineAnim;
+
+  // ── State flags ───────────────────────────────────────────────────────
+  bool _torchOn = false;
+  bool _detected = false; // prevent duplicate callbacks
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    _camController = MobileScannerController(
+      detectionSpeed: DetectionSpeed.normal,
+      facing: CameraFacing.back,
+      torchEnabled: false,
+    );
+
+    // Scan line: bounces between 5 % and 95 % of the viewfinder height.
+    // easeInOut removes the perceived stutter on low-end phones.
+    _lineCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1800),
+    );
+    _lineAnim = Tween<double>(begin: 0.05, end: 0.95).animate(
+      CurvedAnimation(parent: _lineCtrl, curve: Curves.easeInOut),
+    );
+    _lineCtrl.repeat(reverse: true);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Pause/resume animation when app is backgrounded — prevents glitch
+    // on resume seen on some Android OEM camera implementations.
+    if (state == AppLifecycleState.paused) {
+      _lineCtrl.stop();
+    } else if (state == AppLifecycleState.resumed) {
+      _lineCtrl.repeat(reverse: true);
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _lineCtrl.dispose();
+    _camController.dispose();
+    super.dispose();
+  }
+
+  // ── QR detected callback ──────────────────────────────────────────────
+  Future<void> _onDetect(BarcodeCapture capture) async {
+    if (_detected) return;
+    if (capture.barcodes.isEmpty) return;
+    _detected = true;
+
+    // Stop the camera so the frame is frozen while we process.
+    await _camController.stop();
+    _lineCtrl.stop();
+
+    // Capture an image from the live stream.
+    try {
+      final image = await _camController.captureImage();
+      if (image == null) {
+        // Fallback: no image API available — pop without a file.
+        if (mounted) Navigator.of(context).pop<File?>(null);
+        return;
+      }
+      // Save the captured frame as a JPEG temp file.
+      final dir = await getTemporaryDirectory();
+      final file = File(
+        '${dir.path}/live_scan_${DateTime.now().millisecondsSinceEpoch}.jpg',
+      );
+      await file.writeAsBytes(await image.readAsBytes());
+      widget.onImageReady(file);
+    } catch (_) {
+      // captureImage not supported on this device — pop without file.
+      if (mounted) Navigator.of(context).pop<File?>(null);
+    }
+  }
+
+  // ── Toggle torch ─────────────────────────────────────────────────────
+  void _toggleTorch() {
+    setState(() => _torchOn = !_torchOn);
+    _camController.toggleTorch();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final screenSize = MediaQuery.of(context).size;
+    // Viewfinder box: square, 72 % of the narrow side.
+    final boxSize = screenSize.shortestSide * 0.72;
+
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          // ── Live camera feed ────────────────────────────────────────
+          MobileScanner(
+            controller: _camController,
+            onDetect: _onDetect,
+          ),
+
+          // ── Dark overlay with transparent cutout ────────────────────
+          _ScanCutoutOverlay(boxSize: boxSize),
+
+          // ── Animated scan line inside the viewfinder box ────────────
+          Center(
+            child: SizedBox(
+              width: boxSize,
+              height: boxSize,
+              child: AnimatedBuilder(
+                animation: _lineAnim,
+                builder: (_, __) {
+                  return CustomPaint(
+                    painter: _ScanLinePainter(
+                      progress: _lineAnim.value.clamp(0.0, 1.0),
+                      color: AppColors.blue,
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+
+          // ── Corner brackets drawn on top ────────────────────────────
+          Center(
+            child: SizedBox(
+              width: boxSize,
+              height: boxSize,
+              child: CustomPaint(
+                painter: _ViewfinderBracketPainter(color: AppColors.blue),
+              ),
+            ),
+          ),
+
+          // ── Top bar: close + label ──────────────────────────────────
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppSpacing.lg,
+                vertical: AppSpacing.md,
+              ),
+              child: Row(
+                children: [
+                  GestureDetector(
+                    onTap: () => Navigator.of(context).pop<File?>(null),
+                    child: Container(
+                      width: 40,
+                      height: 40,
+                      decoration: BoxDecoration(
+                        color: Colors.black45,
+                        borderRadius: BorderRadius.circular(AppRadius.sm),
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.15),
+                        ),
+                      ),
+                      child: const Icon(
+                        Icons.close_rounded,
+                        color: Colors.white,
+                        size: 20,
+                      ),
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(
+                    'SCAN QR CODE',
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.85),
+                      fontSize: AppFontSize.sm,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 2.0,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                  const Spacer(),
+                  // Torch button
+                  GestureDetector(
+                    onTap: _toggleTorch,
+                    child: Container(
+                      width: 40,
+                      height: 40,
+                      decoration: BoxDecoration(
+                        color: _torchOn
+                            ? AppColors.blue.withValues(alpha: 0.7)
+                            : Colors.black45,
+                        borderRadius: BorderRadius.circular(AppRadius.sm),
+                        border: Border.all(
+                          color: _torchOn
+                              ? AppColors.blue.withValues(alpha: 0.6)
+                              : Colors.white.withValues(alpha: 0.15),
+                        ),
+                      ),
+                      child: Icon(
+                        _torchOn
+                            ? Icons.flash_on_rounded
+                            : Icons.flash_off_rounded,
+                        color: Colors.white,
+                        size: 20,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // ── Bottom hint text ────────────────────────────────────────
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 48,
+            child: Text(
+              'Point camera at a QR code',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.6),
+                fontSize: AppFontSize.sm,
+                fontFamily: 'monospace',
+                letterSpacing: 0.5,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─── Scan Cutout Overlay ──────────────────────────────────────────────────────
+/// Draws a semi-transparent dark overlay with a transparent square hole
+/// centred on screen — the classic QR viewfinder effect.
+class _ScanCutoutOverlay extends StatelessWidget {
+  final double boxSize;
+  const _ScanCutoutOverlay({required this.boxSize});
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      size: Size.infinite,
+      painter: _CutoutPainter(boxSize: boxSize),
+    );
+  }
+}
+
+class _CutoutPainter extends CustomPainter {
+  final double boxSize;
+  _CutoutPainter({required this.boxSize});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final cx = size.width / 2;
+    final cy = size.height / 2;
+    final half = boxSize / 2;
+
+    final outerPath = Path()..addRect(Rect.fromLTWH(0, 0, size.width, size.height));
+    final holePath = Path()
+      ..addRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromCenter(
+            center: Offset(cx, cy),
+            width: boxSize,
+            height: boxSize,
+          ),
+          const Radius.circular(AppRadius.md),
+        ),
+      );
+    final combined = Path.combine(PathOperation.difference, outerPath, holePath);
+
+    canvas.drawPath(
+      combined,
+      Paint()..color = Colors.black.withValues(alpha: 0.65),
+    );
+  }
+
+  @override
+  bool shouldRepaint(_CutoutPainter old) => old.boxSize != boxSize;
+}
+
+// ─── Animated Scan Line Painter ───────────────────────────────────────────────
+/// Draws a single horizontal blue line with a gradient glow that travels
+/// from top to bottom of the viewfinder box. [progress] is 0.0–1.0.
+class _ScanLinePainter extends CustomPainter {
+  final double progress;
+  final Color color;
+  _ScanLinePainter({required this.progress, required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final y = size.height * progress;
+
+    // Glow gradient — fades out above and below the line.
+    final glowPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [
+          color.withValues(alpha: 0.0),
+          color.withValues(alpha: 0.35),
+          color.withValues(alpha: 0.0),
+        ],
+        stops: const [0.0, 0.5, 1.0],
+      ).createShader(
+        Rect.fromLTWH(0, y - 18, size.width, 36),
+      );
+    canvas.drawRect(Rect.fromLTWH(0, y - 18, size.width, 36), glowPaint);
+
+    // Solid line
+    canvas.drawLine(
+      Offset(0, y),
+      Offset(size.width, y),
+      Paint()
+        ..color = color
+        ..strokeWidth = 2.0
+        ..strokeCap = StrokeCap.round,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_ScanLinePainter old) =>
+      old.progress != progress || old.color != color;
+}
+
+// ─── Viewfinder Bracket Painter ───────────────────────────────────────────────
+/// Draws the four corner L-brackets of a QR viewfinder.
+class _ViewfinderBracketPainter extends CustomPainter {
+  final Color color;
+  _ViewfinderBracketPainter({required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const armLen = 28.0; // length of each bracket arm
+    const strokeW = 3.5;
+    const radius = AppRadius.md;
+
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = strokeW
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round;
+
+    // Top-left
+    canvas.drawPath(
+      Path()
+        ..moveTo(0 + radius, 0)
+        ..lineTo(armLen, 0)
+        ..moveTo(0, radius)
+        ..lineTo(0, armLen),
+      paint,
+    );
+
+    // Top-right
+    canvas.drawPath(
+      Path()
+        ..moveTo(size.width - armLen, 0)
+        ..lineTo(size.width - radius, 0)
+        ..moveTo(size.width, radius)
+        ..lineTo(size.width, armLen),
+      paint,
+    );
+
+    // Bottom-left
+    canvas.drawPath(
+      Path()
+        ..moveTo(0, size.height - armLen)
+        ..lineTo(0, size.height - radius)
+        ..moveTo(radius, size.height)
+        ..lineTo(armLen, size.height),
+      paint,
+    );
+
+    // Bottom-right
+    canvas.drawPath(
+      Path()
+        ..moveTo(size.width - armLen, size.height)
+        ..lineTo(size.width - radius, size.height)
+        ..moveTo(size.width, size.height - armLen)
+        ..lineTo(size.width, size.height - radius),
+      paint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_ViewfinderBracketPainter old) => old.color != color;
 }
 
 // ─── Score Meter ───────────────────────────────────────────────────────────────
