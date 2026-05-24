@@ -2150,33 +2150,6 @@ class _TestingScreenState extends State<TestingScreen> {
       ],
     );
   }
-
-  Future<void> _launchUrl(String url) async {
-    Uri? uri;
-    if (url.startsWith('http://') || url.startsWith('https://')) {
-      uri = Uri.tryParse(url);
-    } else {
-      uri = Uri.tryParse('https://$url');
-    }
-    if (uri == null) return;
-    try {
-      final launched = await launchUrl(
-        uri,
-        mode: LaunchMode.externalApplication,
-      );
-      if (!launched && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Could not open the URL')),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error opening URL: $e')),
-        );
-      }
-    }
-  }
 }
 
 // ─── Score Meter ───────────────────────────────────────────────────────────────
