@@ -17,7 +17,7 @@ import 'package:intl/intl.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:google_mlkit_barcode_scanning/google_mlkit_barcode_scanning.dart';
 import 'package:image/image.dart' as img;
-import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:mobile_scanner/mobile_scanner.dart' as ms;
 
 // ─── Design Tokens ─────────────────────────────────────────────────────────────
 // Following 4-base rule: 4, 8, 12, 16, 20, 24, 32, 40, 48, 64
@@ -2193,7 +2193,7 @@ class _LiveScannerScreen extends StatefulWidget {
 class _LiveScannerScreenState extends State<_LiveScannerScreen>
     with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   // ── Camera controller ─────────────────────────────────────────────────
-  late final MobileScannerController _camController;
+  late final ms.MobileScannerController _camController;
 
   // ── Scan-line animation ────────────────────────────────────────────────
   late final AnimationController _lineCtrl;
@@ -2208,10 +2208,11 @@ class _LiveScannerScreenState extends State<_LiveScannerScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
 
-    _camController = MobileScannerController(
-      detectionSpeed: DetectionSpeed.normal,
-      facing: CameraFacing.back,
+    _camController = ms.MobileScannerController(
+      detectionSpeed: ms.DetectionSpeed.normal,
+      facing: ms.CameraFacing.back,
       torchEnabled: false,
+      returnImage: true,
     );
 
     // Scan line: bounces between 5 % and 95 % of the viewfinder height.
@@ -2246,7 +2247,7 @@ class _LiveScannerScreenState extends State<_LiveScannerScreen>
   }
 
   // ── QR detected callback ──────────────────────────────────────────────
-  Future<void> _onDetect(BarcodeCapture capture) async {
+  Future<void> _onDetect(ms.BarcodeCapture capture) async {
     if (_detected) return;
     if (capture.barcodes.isEmpty) return;
     _detected = true;
@@ -2255,11 +2256,11 @@ class _LiveScannerScreenState extends State<_LiveScannerScreen>
     await _camController.stop();
     _lineCtrl.stop();
 
-    // Capture an image from the live stream.
+    // Use the image delivered with the BarcodeCapture (returnImage: true).
     try {
-      final image = await _camController.captureImage();
-      if (image == null) {
-        // Fallback: no image API available — pop without a file.
+      final imageBytes = capture.image;
+      if (imageBytes == null) {
+        // Fallback: no image data available — pop without a file.
         if (mounted) Navigator.of(context).pop<File?>(null);
         return;
       }
@@ -2268,10 +2269,10 @@ class _LiveScannerScreenState extends State<_LiveScannerScreen>
       final file = File(
         '${dir.path}/live_scan_${DateTime.now().millisecondsSinceEpoch}.jpg',
       );
-      await file.writeAsBytes(await image.readAsBytes());
+      await file.writeAsBytes(imageBytes);
       widget.onImageReady(file);
     } catch (_) {
-      // captureImage not supported on this device — pop without file.
+      // Image unavailable on this device — pop without file.
       if (mounted) Navigator.of(context).pop<File?>(null);
     }
   }
@@ -2294,7 +2295,7 @@ class _LiveScannerScreenState extends State<_LiveScannerScreen>
         fit: StackFit.expand,
         children: [
           // ── Live camera feed ────────────────────────────────────────
-          MobileScanner(
+          ms.MobileScanner(
             controller: _camController,
             onDetect: _onDetect,
           ),
